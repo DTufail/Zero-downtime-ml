@@ -1,1 +1,805 @@
-# THE deployment script (runs on host)
+#!/usr/bin/env python3
+"""
+Zero-Downtime Deployment Orchestrator
+
+Automates blue-green deployment of SmolLM2 model server.
+Runs on the HOST machine (not inside a container).
+
+Usage:
+    python deploy/orchestrator.py deploy          # Run a deployment
+    python deploy/orchestrator.py status          # Show current state
+    python deploy/orchestrator.py rollback        # Emergency rollback to previous
+    python deploy/orchestrator.py history         # Show deployment history
+"""
+
+import argparse
+import json
+import logging
+import shutil
+import subprocess
+import sys
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+
+
+class DeploymentError(Exception):
+    """Raised when a deployment step fails."""
+    pass
+
+
+class DeploymentOrchestrator:
+    def __init__(self, project_root: str, health_timeout: int = 180, drain_seconds: int = 15):
+        self.project_root = Path(project_root).resolve()
+        self.state_file = self.project_root / "deploy" / "state.json"
+        self.nginx_conf_dir = self.project_root / "nginx" / "conf.d"
+        self.nginx_templates_dir = self.project_root / "nginx"
+        self.compose_file = self.project_root / "docker-compose.yml"
+        self.log_file = self.project_root / "deploy" / "deploy.log"
+        self.health_timeout = health_timeout
+        self.drain_seconds = drain_seconds
+
+        self.logger = self._setup_logger()
+
+    def _setup_logger(self) -> logging.Logger:
+        logger = logging.getLogger("orchestrator")
+        logger.setLevel(logging.DEBUG)
+
+        # Stdout handler
+        stdout_handler = logging.StreamHandler(sys.stdout)
+        stdout_handler.setLevel(logging.INFO)
+        stdout_fmt = logging.Formatter(
+            "%(asctime)s [%(levelname)s] %(message)s", datefmt="%H:%M:%S"
+        )
+        stdout_handler.setFormatter(stdout_fmt)
+
+        # File handler (structured JSON log)
+        self.log_file.parent.mkdir(parents=True, exist_ok=True)
+        file_handler = logging.FileHandler(self.log_file)
+        file_handler.setLevel(logging.DEBUG)
+        file_fmt = logging.Formatter(
+            '{"time": "%(asctime)s", "level": "%(levelname)s", "msg": "%(message)s"}',
+            datefmt="%Y-%m-%dT%H:%M:%S",
+        )
+        file_handler.setFormatter(file_fmt)
+
+        if not logger.handlers:
+            logger.addHandler(stdout_handler)
+            logger.addHandler(file_handler)
+
+        return logger
+
+    def log(self, msg: str, level: str = "INFO"):
+        getattr(self.logger, level.lower(), self.logger.info)(msg)
+
+    # ── State Management ──────────────────────────────────────────
+
+    def read_state(self) -> dict:
+        if not self.state_file.exists():
+            default_state = {
+                "active_color": "blue",
+                "active_port": 8000,
+                "standby_color": "green",
+                "standby_port": 8001,
+                "last_deployment": None,
+                "last_model_version": "smollm2-1.7b-q4",
+                "deployment_count": 0,
+                "history": [],
+            }
+            self.save_state(default_state)
+            return default_state
+        with open(self.state_file) as f:
+            return json.load(f)
+
+    def save_state(self, state: dict) -> None:
+        if self.state_file.exists():
+            shutil.copy2(self.state_file, str(self.state_file) + ".bak")
+        self.state_file.parent.mkdir(parents=True, exist_ok=True)
+        with open(self.state_file, "w") as f:
+            json.dump(state, f, indent=4)
+            f.write("\n")
+
+    # ── Command Execution ─────────────────────────────────────────
+
+    def run_command(
+        self, cmd, timeout: int = 30, check: bool = True
+    ) -> subprocess.CompletedProcess:
+        if isinstance(cmd, str):
+            cmd_list = cmd.split()
+            cmd_str = cmd
+        else:
+            cmd_list = list(cmd)
+            cmd_str = " ".join(cmd)
+
+        self.log(f"  $ {cmd_str}", level="DEBUG")
+        try:
+            result = subprocess.run(
+                cmd_list,
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+                cwd=str(self.project_root),
+            )
+            if check and result.returncode != 0:
+                self.log(
+                    f"  Command failed (rc={result.returncode}): {result.stderr.strip()}",
+                    level="ERROR",
+                )
+                raise DeploymentError(
+                    f"Command failed: {cmd_str}\nstderr: {result.stderr.strip()}"
+                )
+            return result
+        except subprocess.TimeoutExpired:
+            raise DeploymentError(f"Command timed out after {timeout}s: {cmd_str}")
+
+    # ── Health Checking ───────────────────────────────────────────
+
+    def check_container_health(
+        self,
+        port: int,
+        endpoint: str = "/ready",
+        timeout: int = 120,
+        poll_interval: int = 2,
+    ) -> bool:
+        url = f"http://localhost:{port}{endpoint}"
+        start = time.time()
+        attempts = 0
+
+        while time.time() - start < timeout:
+            attempts += 1
+            try:
+                result = subprocess.run(
+                    ["curl", "-sf", "--max-time", "25", url],
+                    capture_output=True,
+                    text=True,
+                    timeout=30,
+                )
+                if result.returncode == 0:
+                    try:
+                        body = json.loads(result.stdout)
+                        if body.get("status") == "ready":
+                            self.log(
+                                f"  Health OK after {attempts} attempts "
+                                f"({round(time.time() - start, 1)}s)"
+                            )
+                            return True
+                        self.log(
+                            f"  Poll {attempts}: status={body.get('status', 'unknown')}"
+                        )
+                    except json.JSONDecodeError:
+                        self.log(f"  Poll {attempts}: non-JSON response")
+                else:
+                    self.log(
+                        f"  Poll {attempts}: HTTP error (curl rc={result.returncode})"
+                    )
+            except (subprocess.TimeoutExpired, Exception) as e:
+                self.log(
+                    f"  Poll {attempts}: connection failed ({type(e).__name__})"
+                )
+
+            time.sleep(poll_interval)
+
+        self.log(
+            f"  Health check timed out after {timeout}s ({attempts} attempts)"
+        )
+        return False
+
+    # ── Helper: check if a compose service is running ─────────────
+
+    def _is_service_running(self, service: str, profile: bool = False) -> bool:
+        cmd = "docker compose"
+        if profile:
+            cmd += " --profile deploy"
+        cmd += f" ps {service} --format json"
+        result = self.run_command(cmd, timeout=10, check=False)
+        if not result.stdout.strip():
+            return False
+        try:
+            for line in result.stdout.strip().splitlines():
+                line = line.strip()
+                if line:
+                    c = json.loads(line)
+                    if c.get("State") == "running":
+                        return True
+        except json.JSONDecodeError:
+            return "running" in result.stdout.lower()
+        return False
+
+    # ── Pre-flight Checks ─────────────────────────────────────────
+
+    def preflight_checks(self, state: dict) -> None:
+        active = state["active_color"]
+        standby = state["standby_color"]
+        active_port = state["active_port"]
+
+        # 1. Active container running
+        if not self._is_service_running(active):
+            raise DeploymentError(
+                f"Active container '{active}' is not running"
+            )
+        self.log(f"  {active} container is running")
+
+        # 2. Active container healthy
+        self.log(f"  Checking {active} readiness on port {active_port}...")
+        healthy = self.check_container_health(active_port, timeout=120, poll_interval=2)
+        if not healthy:
+            raise DeploymentError(
+                f"Active container '{active}' is not healthy on port {active_port}"
+            )
+
+        # 3. Nginx running
+        if not self._is_service_running("nginx"):
+            raise DeploymentError("Nginx container is not running")
+        self.log("  Nginx is running")
+
+        # 4. Nginx routing to active
+        try:
+            r = subprocess.run(
+                ["curl", "-sf", "--max-time", "5", "http://localhost/healthz"],
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+            if r.returncode != 0:
+                raise DeploymentError(
+                    "Nginx is not routing traffic (port 80 /healthz failed)"
+                )
+        except subprocess.TimeoutExpired:
+            raise DeploymentError("Nginx health check timed out")
+        self.log("  Nginx routing OK via port 80")
+
+        # 5. No leftover standby container
+        if self._is_service_running(standby, profile=True):
+            self.log(f"  Leftover {standby} container found, stopping it...")
+            self.run_command(
+                f"docker compose --profile deploy stop {standby}",
+                timeout=30,
+                check=False,
+            )
+            self.run_command(
+                f"docker compose --profile deploy rm -f {standby}",
+                timeout=10,
+                check=False,
+            )
+
+        # 6. Disk space (informational)
+        self.run_command("docker system df", timeout=10, check=False)
+        self.log("  Disk space check passed")
+
+    # ── Container Management ──────────────────────────────────────
+
+    def start_standby(self, state: dict) -> None:
+        standby = state["standby_color"]
+        self.log(f"  Starting {standby} container...")
+        self.run_command(
+            f"docker compose --profile deploy up -d {standby}", timeout=30
+        )
+
+        # Wait for Docker to initialize
+        time.sleep(5)
+
+        # Verify container is running
+        if not self._is_service_running(standby, profile=True):
+            logs = self.run_command(
+                f"docker compose --profile deploy logs --tail=20 {standby}",
+                timeout=10,
+                check=False,
+            )
+            self.log(f"  Container logs:\n{logs.stdout}", level="ERROR")
+            raise DeploymentError(f"Container '{standby}' failed to start")
+
+    def warmup_inference(self, port: int) -> None:
+        self.log(f"  Sending warm-up inference to port {port}...")
+        start = time.time()
+        try:
+            result = subprocess.run(
+                [
+                    "curl",
+                    "-sf",
+                    "--max-time",
+                    "30",
+                    "-X",
+                    "POST",
+                    f"http://localhost:{port}/chat",
+                    "-H",
+                    "Content-Type: application/json",
+                    "-d",
+                    json.dumps(
+                        {"message": "Hello, respond in one word.", "max_tokens": 10}
+                    ),
+                ],
+                capture_output=True,
+                text=True,
+                timeout=35,
+            )
+            elapsed = round(time.time() - start, 1)
+
+            if result.returncode != 0:
+                raise DeploymentError(
+                    f"Warm-up inference failed (curl rc={result.returncode}): "
+                    f"{result.stderr}"
+                )
+
+            body = json.loads(result.stdout)
+            if "response" in body:
+                self.log(
+                    f"  Warm-up OK in {elapsed}s: "
+                    f"{body['response'][:50]}..."
+                )
+            else:
+                raise DeploymentError(
+                    f"Warm-up response missing 'response' field: {body}"
+                )
+
+        except json.JSONDecodeError:
+            raise DeploymentError(
+                f"Warm-up returned non-JSON: {result.stdout[:200]}"
+            )
+        except subprocess.TimeoutExpired:
+            raise DeploymentError("Warm-up inference timed out after 30s")
+
+    # ── Nginx Management ──────────────────────────────────────────
+
+    def swap_nginx(self, target_color: str) -> str:
+        default_conf = self.nginx_conf_dir / "default.conf"
+        template = self.nginx_templates_dir / f"upstream-{target_color}.conf"
+
+        # 1. Read current config as backup
+        original_config = default_conf.read_text()
+
+        # 2. Copy template to active config
+        default_conf.write_text(template.read_text())
+        self.log(f"  Wrote upstream-{target_color}.conf -> conf.d/default.conf")
+
+        # 3. Test nginx config
+        try:
+            self.run_command("docker exec smollm2-nginx nginx -t", timeout=5)
+        except DeploymentError as e:
+            self.log("  nginx -t failed, restoring original config...", level="ERROR")
+            default_conf.write_text(original_config)
+            raise DeploymentError(f"Nginx config test failed: {e}")
+
+        # 4. Reload nginx
+        try:
+            self.run_command(
+                "docker exec smollm2-nginx nginx -s reload", timeout=5
+            )
+        except DeploymentError as e:
+            self.log(
+                "  nginx reload failed, restoring original config...",
+                level="ERROR",
+            )
+            default_conf.write_text(original_config)
+            try:
+                self.run_command(
+                    "docker exec smollm2-nginx nginx -s reload", timeout=5
+                )
+            except Exception:
+                pass
+            raise DeploymentError(f"Nginx reload failed: {e}")
+
+        return original_config
+
+    def verify_traffic_switched(self, target_port: int) -> bool:
+        self.log("  Sending 3 verification requests via nginx...")
+        successes = 0
+        for i in range(3):
+            try:
+                result = subprocess.run(
+                    [
+                        "curl",
+                        "-sf",
+                        "--max-time",
+                        "5",
+                        "http://localhost/healthz",
+                    ],
+                    capture_output=True,
+                    text=True,
+                    timeout=10,
+                )
+                if result.returncode == 0:
+                    body = json.loads(result.stdout)
+                    if body.get("status") == "alive":
+                        successes += 1
+                        self.log(f"  Verification {i + 1}/3: OK")
+                    else:
+                        self.log(
+                            f"  Verification {i + 1}/3: "
+                            f"unexpected status {body.get('status')}"
+                        )
+                else:
+                    self.log(
+                        f"  Verification {i + 1}/3: "
+                        f"failed (rc={result.returncode})"
+                    )
+            except Exception as e:
+                self.log(f"  Verification {i + 1}/3: error ({e})")
+            if i < 2:
+                time.sleep(1)
+
+        return successes == 3
+
+    def rollback_nginx(self, original_config: str) -> None:
+        default_conf = self.nginx_conf_dir / "default.conf"
+        default_conf.write_text(original_config)
+        self.run_command("docker exec smollm2-nginx nginx -t", timeout=5)
+        self.run_command("docker exec smollm2-nginx nginx -s reload", timeout=5)
+        self.log("  Nginx rolled back to previous upstream")
+
+    def drain_and_stop_old(self, old_color: str, drain_seconds: int = 15) -> None:
+        if drain_seconds > 0:
+            self.log(f"  Draining {old_color} for {drain_seconds}s...")
+            time.sleep(drain_seconds)
+        self.log(f"  Stopping {old_color}...")
+        self.run_command(
+            f"docker compose --profile deploy stop {old_color}",
+            timeout=60,
+            check=False,
+        )
+        self.run_command(
+            f"docker compose --profile deploy rm -f {old_color}",
+            timeout=10,
+            check=False,
+        )
+        self.log(f"  {old_color} stopped and removed")
+
+    # ── Main Deploy Sequence ──────────────────────────────────────
+
+    def deploy(self) -> None:
+        state = self.read_state()
+        active_color = state["active_color"]
+        target_color = state["standby_color"]
+        active_port = state["active_port"]
+        target_port = state["standby_port"]
+        original_nginx_config = None
+        deployment_start = time.time()
+
+        self.log("=" * 60)
+        self.log(f"DEPLOYMENT START: {active_color} -> {target_color}")
+        self.log("=" * 60)
+
+        try:
+            # Step 1-2: State
+            self.log(
+                f"Step 1-2: Active={active_color}:{active_port}, "
+                f"Target={target_color}:{target_port}"
+            )
+
+            # Step 3: Pre-flight
+            self.log("Step 3: Pre-flight checks...")
+            self.preflight_checks(state)
+            self.log("Step 3: Pre-flight passed")
+
+            # Step 4: Start standby
+            self.log("Step 4: Starting standby container...")
+            self.start_standby(state)
+            self.log("Step 4: Container started")
+
+            # Step 5: Health poll
+            self.log(f"Step 5: Polling health endpoint (timeout={self.health_timeout}s)...")
+            healthy = self.check_container_health(target_port, timeout=self.health_timeout)
+            if not healthy:
+                raise DeploymentError(
+                    f"Step 5: {target_color} failed health check after {self.health_timeout}s"
+                )
+            self.log("Step 5: Health check passed")
+
+            # Step 6: Warm-up
+            self.log("Step 6: Warm-up inference...")
+            self.warmup_inference(target_port)
+            self.log("Step 6: Inference verified")
+
+            # ── POINT OF NO RETURN ──
+            # Before this: rollback = just stop the new container
+            # After this: rollback = swap nginx back
+
+            # Step 7-9: Swap nginx
+            self.log("Step 7-9: Swapping nginx upstream...")
+            original_nginx_config = self.swap_nginx(target_color)
+            self.log("Step 7-9: Nginx reloaded")
+
+            # Step 10: Drain
+            self.log(f"Step 10: Draining old connections ({self.drain_seconds}s)...")
+            time.sleep(self.drain_seconds)
+            self.log("Step 10: Drain complete")
+
+            # Step 11: Verify
+            self.log("Step 11: Verifying traffic switch...")
+            switched = self.verify_traffic_switched(target_port)
+            if not switched:
+                raise DeploymentError(
+                    "Step 11: Traffic not reaching target after nginx reload"
+                )
+            self.log("Step 11: Traffic verified on target")
+
+            # Step 12: Stop old
+            self.log("Step 12: Stopping old container...")
+            self.drain_and_stop_old(active_color, drain_seconds=0)
+            self.log("Step 12: Old container stopped")
+
+            # Step 13: Update state
+            elapsed = round(time.time() - deployment_start, 1)
+            now = datetime.now(timezone.utc).isoformat()
+            new_state = {
+                "active_color": target_color,
+                "active_port": target_port,
+                "standby_color": active_color,
+                "standby_port": active_port,
+                "last_deployment": now,
+                "last_model_version": state.get(
+                    "last_model_version", "unknown"
+                ),
+                "deployment_count": state.get("deployment_count", 0) + 1,
+                "history": state.get("history", [])
+                + [
+                    {
+                        "timestamp": now,
+                        "from_color": active_color,
+                        "to_color": target_color,
+                        "duration_seconds": elapsed,
+                        "success": True,
+                    }
+                ],
+            }
+            new_state["history"] = new_state["history"][-20:]
+            self.save_state(new_state)
+
+            self.log("=" * 60)
+            self.log(
+                f"DEPLOYMENT COMPLETE: {target_color} is now active ({elapsed}s)"
+            )
+            self.log("=" * 60)
+
+        except DeploymentError as e:
+            self.log(f"DEPLOYMENT FAILED: {e}", level="ERROR")
+
+            # Rollback nginx if we already swapped
+            if original_nginx_config is not None:
+                self.log("Rolling back nginx config...")
+                try:
+                    self.rollback_nginx(original_nginx_config)
+                    self.log("Nginx rolled back")
+                except Exception as rollback_err:
+                    self.log(
+                        f"CRITICAL: Nginx rollback failed: {rollback_err}",
+                        level="CRITICAL",
+                    )
+
+            # Always try to stop the standby container on failure
+            self.log(f"Stopping failed {target_color} container...")
+            try:
+                self.run_command(
+                    f"docker compose --profile deploy stop {target_color}",
+                    timeout=30,
+                    check=False,
+                )
+                self.run_command(
+                    f"docker compose --profile deploy rm -f {target_color}",
+                    timeout=10,
+                    check=False,
+                )
+                self.log(f"{target_color} stopped")
+            except Exception:
+                self.log(
+                    f"Warning: Could not stop {target_color}", level="WARNING"
+                )
+
+            # Record failure in history
+            state = self.read_state()
+            elapsed = round(time.time() - deployment_start, 1)
+            state.setdefault("history", []).append(
+                {
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                    "from_color": active_color,
+                    "to_color": target_color,
+                    "duration_seconds": elapsed,
+                    "success": False,
+                    "error": str(e),
+                }
+            )
+            state["history"] = state["history"][-20:]
+            self.save_state(state)
+
+            raise
+
+    # ── Rollback Command ──────────────────────────────────────────
+
+    def rollback(self) -> None:
+        state = self.read_state()
+        target_color = state["standby_color"]
+        target_port = state["standby_port"]
+        current_active = state["active_color"]
+
+        self.log("=" * 60)
+        self.log(f"ROLLBACK: {current_active} -> {target_color}")
+        self.log("=" * 60)
+
+        # Check if target container is running; if not, start it
+        if not self._is_service_running(target_color, profile=True):
+            self.log(f"  {target_color} not running, starting it...")
+            self.run_command(
+                f"docker compose --profile deploy up -d {target_color}",
+                timeout=30,
+            )
+            self.log(f"  Waiting for {target_color} health check...")
+            healthy = self.check_container_health(target_port, timeout=60)
+            if not healthy:
+                raise DeploymentError(
+                    f"Rollback target '{target_color}' failed health check"
+                )
+
+        # Swap nginx
+        template = self.nginx_templates_dir / f"upstream-{target_color}.conf"
+        default_conf = self.nginx_conf_dir / "default.conf"
+        default_conf.write_text(template.read_text())
+        self.run_command("docker exec smollm2-nginx nginx -t", timeout=5)
+        self.run_command(
+            "docker exec smollm2-nginx nginx -s reload", timeout=5
+        )
+
+        # Verify
+        time.sleep(2)
+        switched = self.verify_traffic_switched(target_port)
+        if not switched:
+            self.log(
+                "WARNING: Traffic verification failed after rollback",
+                level="WARNING",
+            )
+
+        # Update state
+        now = datetime.now(timezone.utc).isoformat()
+        new_state = {
+            "active_color": target_color,
+            "active_port": target_port,
+            "standby_color": current_active,
+            "standby_port": state["active_port"],
+            "last_deployment": now,
+            "last_model_version": state.get("last_model_version", "unknown"),
+            "deployment_count": state.get("deployment_count", 0) + 1,
+            "history": state.get("history", [])
+            + [
+                {
+                    "timestamp": now,
+                    "from_color": current_active,
+                    "to_color": target_color,
+                    "duration_seconds": 0,
+                    "success": True,
+                    "rollback": True,
+                }
+            ],
+        }
+        new_state["history"] = new_state["history"][-20:]
+        self.save_state(new_state)
+
+        self.log("=" * 60)
+        self.log(f"ROLLBACK COMPLETE: {target_color} is now active")
+        self.log("=" * 60)
+
+    # ── Status & History ──────────────────────────────────────────
+
+    def status(self) -> None:
+        state = self.read_state()
+        print(f"\n{'=' * 50}")
+        print("  Deployment State")
+        print(f"{'=' * 50}")
+        print(
+            f"  Active:      {state['active_color']} "
+            f"(port {state['active_port']})"
+        )
+        print(
+            f"  Standby:     {state['standby_color']} "
+            f"(port {state['standby_port']})"
+        )
+        print(f"  Deployments: {state.get('deployment_count', 0)}")
+        print(f"  Last Deploy: {state.get('last_deployment', 'never')}")
+        print(f"  Model:       {state.get('last_model_version', 'unknown')}")
+        print()
+
+        # Container status
+        print("  Container Status:")
+        result = self.run_command(
+            "docker compose --profile deploy ps", timeout=10, check=False
+        )
+        if result.stdout.strip():
+            for line in result.stdout.strip().splitlines():
+                print(f"    {line}")
+        print()
+
+        # Memory usage
+        print("  Memory Usage:")
+        result = self.run_command(
+            "docker stats --no-stream --format"
+            " table {{.Name}}\t{{.MemUsage}}\t{{.MemPerc}}",
+            timeout=10,
+            check=False,
+        )
+        if result.stdout.strip():
+            for line in result.stdout.strip().splitlines():
+                if "smollm2" in line.lower() or "NAME" in line:
+                    print(f"    {line}")
+        print()
+
+        # Active nginx config
+        print("  Nginx Upstream:")
+        default_conf = self.nginx_conf_dir / "default.conf"
+        if default_conf.exists():
+            content = default_conf.read_text()
+            for line in content.splitlines():
+                if "server " in line and "listen" not in line:
+                    print(f"    {line.strip()}")
+        print(f"{'=' * 50}\n")
+
+    def show_history(self) -> None:
+        state = self.read_state()
+        history = state.get("history", [])
+
+        if not history:
+            print("No deployment history.")
+            return
+
+        print(f"\n{'=' * 70}")
+        print(f"  Deployment History (last {len(history)} entries)")
+        print(f"{'=' * 70}")
+        for i, entry in enumerate(reversed(history), 1):
+            status = "OK" if entry.get("success") else "FAILED"
+            rollback = " [ROLLBACK]" if entry.get("rollback") else ""
+            error = f" - {entry['error']}" if entry.get("error") else ""
+            print(
+                f"  {i}. [{status}{rollback}] "
+                f"{entry.get('from_color', '?')} -> "
+                f"{entry.get('to_color', '?')} "
+                f"| {entry.get('duration_seconds', '?')}s "
+                f"| {entry.get('timestamp', '?')}{error}"
+            )
+        print(f"{'=' * 70}\n")
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(
+        description="Zero-Downtime Deployment Orchestrator"
+    )
+    parser.add_argument(
+        "command",
+        choices=["deploy", "status", "rollback", "history"],
+        help="Command to execute",
+    )
+    parser.add_argument(
+        "--project-root",
+        default=".",
+        help="Path to project root (default: current directory)",
+    )
+    parser.add_argument(
+        "--drain-seconds",
+        type=int,
+        default=15,
+        help="Seconds to wait for connection draining",
+    )
+    parser.add_argument(
+        "--health-timeout",
+        type=int,
+        default=180,
+        help="Seconds to wait for health check (default: 180)",
+    )
+    args = parser.parse_args()
+
+    orchestrator = DeploymentOrchestrator(
+        project_root=args.project_root,
+        health_timeout=args.health_timeout,
+        drain_seconds=args.drain_seconds,
+    )
+
+    try:
+        if args.command == "deploy":
+            orchestrator.deploy()
+        elif args.command == "status":
+            orchestrator.status()
+        elif args.command == "rollback":
+            orchestrator.rollback()
+        elif args.command == "history":
+            orchestrator.show_history()
+    except DeploymentError as e:
+        print(f"\nDeployment error: {e}", file=sys.stderr)
+        sys.exit(1)
+    except KeyboardInterrupt:
+        print("\nAborted by user.", file=sys.stderr)
+        sys.exit(130)

@@ -1,3 +1,163 @@
 {
-  "comment": "Current deployment state"
+    "active_color": "blue",
+    "active_port": 8000,
+    "standby_color": "green",
+    "standby_port": 8001,
+    "last_deployment": "2026-02-15T15:42:18.811488+00:00",
+    "last_model_version": "smollm2-1.7b-q4",
+    "deployment_count": 12,
+    "history": [
+        {
+            "timestamp": "2026-02-15T10:47:37.489877+00:00",
+            "from_color": "blue",
+            "to_color": "green",
+            "duration_seconds": 105.3,
+            "success": true
+        },
+        {
+            "timestamp": "2026-02-15T10:50:24.644264+00:00",
+            "from_color": "green",
+            "to_color": "blue",
+            "duration_seconds": 162.1,
+            "success": false,
+            "error": "Step 5: blue failed health check after 120s"
+        },
+        {
+            "timestamp": "2026-02-15T10:56:20.653319+00:00",
+            "from_color": "green",
+            "to_color": "blue",
+            "duration_seconds": 80.8,
+            "success": true
+        },
+        {
+            "timestamp": "2026-02-15T10:57:39.998295+00:00",
+            "from_color": "blue",
+            "to_color": "green",
+            "duration_seconds": 74.2,
+            "success": true
+        },
+        {
+            "timestamp": "2026-02-15T11:24:31.394525+00:00",
+            "from_color": "green",
+            "to_color": "blue",
+            "duration_seconds": 4.8,
+            "success": false,
+            "error": "Active container 'green' is not running"
+        },
+        {
+            "timestamp": "2026-02-15T11:26:27.972692+00:00",
+            "from_color": "green",
+            "to_color": "blue",
+            "duration_seconds": 3.1,
+            "success": false,
+            "error": "Active container 'green' is not running"
+        },
+        {
+            "timestamp": "2026-02-15T11:35:27.507600+00:00",
+            "from_color": "green",
+            "to_color": "blue",
+            "duration_seconds": 56.8,
+            "success": false,
+            "error": "Active container 'green' is not healthy on port 8001"
+        },
+        {
+            "timestamp": "2026-02-15T11:40:53.289881+00:00",
+            "from_color": "green",
+            "to_color": "blue",
+            "duration_seconds": 65.2,
+            "success": false,
+            "error": "Active container 'green' is not healthy on port 8001"
+        },
+        {
+            "timestamp": "2026-02-15T11:47:36.741581+00:00",
+            "from_color": "green",
+            "to_color": "blue",
+            "duration_seconds": 235.4,
+            "success": false,
+            "error": "Step 5: blue failed health check after 180s"
+        },
+        {
+            "timestamp": "2026-02-15T13:31:03.882009+00:00",
+            "from_color": "green",
+            "to_color": "blue",
+            "duration_seconds": 60.1,
+            "success": true
+        },
+        {
+            "timestamp": "2026-02-15T13:34:00.990319+00:00",
+            "from_color": "blue",
+            "to_color": "green",
+            "duration_seconds": 106.0,
+            "success": true
+        },
+        {
+            "timestamp": "2026-02-15T13:35:26.927853+00:00",
+            "from_color": "green",
+            "to_color": "blue",
+            "duration_seconds": 83.9,
+            "success": true
+        },
+        {
+            "timestamp": "2026-02-15T13:42:07.987905+00:00",
+            "from_color": "blue",
+            "to_color": "green",
+            "duration_seconds": 106.7,
+            "success": true
+        },
+        {
+            "timestamp": "2026-02-15T14:10:13.244113+00:00",
+            "from_color": "green",
+            "to_color": "blue",
+            "duration_seconds": 246.4,
+            "success": false,
+            "error": "Step 5: blue failed health check after 180s"
+        },
+        {
+            "timestamp": "2026-02-15T15:35:20.345859+00:00",
+            "from_color": "green",
+            "to_color": "blue",
+            "duration_seconds": 9.2,
+            "success": false,
+            "error": "Active container 'green' is not running"
+        },
+        {
+            "timestamp": "2026-02-15T15:39:30.694199+00:00",
+            "from_color": "green",
+            "to_color": "blue",
+            "duration_seconds": 6.4,
+            "success": false,
+            "error": "Active container 'green' is not running"
+        },
+        {
+            "timestamp": "2026-02-15T15:40:03.732249+00:00",
+            "from_color": "green",
+            "to_color": "blue",
+            "duration_seconds": 1.0,
+            "success": false,
+            "error": "Active container 'green' is not running"
+        },
+        {
+            "timestamp": "2026-02-15T15:42:18.811488+00:00",
+            "from_color": "green",
+            "to_color": "blue",
+            "duration_seconds": 115.8,
+            "success": true
+        },
+        {
+            "timestamp": "2026-02-15T15:46:38.269311+00:00",
+            "from_color": "blue",
+            "to_color": "green",
+            "duration_seconds": 164.0,
+            "success": false,
+            "error": "Step 11: Traffic not reaching target after nginx reload"
+        },
+        {
+            "timestamp": "2026-02-15T16:17:21.480771+00:00",
+            "from_color": "blue",
+            "to_color": "green",
+            "duration_seconds": 217.3,
+            "success": false,
+            "error": "Step 5: green failed health check after 180s"
+        }
+    ]
 }

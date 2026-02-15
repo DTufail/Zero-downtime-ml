@@ -1,1 +1,136 @@
-# Full system topology
+services:
+  blue:
+    build: .
+    container_name: smollm2-blue
+    ports:
+      - "8000:8000"
+    mem_limit: 2g
+    mem_reservation: 1.2g
+    memswap_limit: 2g
+    restart: unless-stopped
+    stop_grace_period: 30s
+    volumes:
+      - ./models:/models:ro
+      - app-data:/data
+    environment:
+      - MODEL_PATH=/models/smollm2.gguf
+      - PORT=8000
+      - MODEL_N_CTX=1024
+      - MODEL_N_THREADS=4
+      - LOG_LEVEL=INFO
+      - CONTAINER_MEMORY_LIMIT_MB=2500
+      - DEPLOYMENT_COLOR=blue
+    env_file:
+      - .env
+    labels:
+      - "deployment.color=blue"
+      - "deployment.port=8000"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/healthz"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 120s
+    networks:
+      - app-network
+
+  green:
+    build: .
+    container_name: smollm2-green
+    ports:
+      - "8001:8000"
+    mem_limit: 2g
+    mem_reservation: 1.2g
+    memswap_limit: 2g
+    restart: unless-stopped
+    stop_grace_period: 30s
+    volumes:
+      - ./models:/models:ro
+      - app-data:/data
+    environment:
+      - MODEL_PATH=/models/smollm2.gguf
+      - PORT=8000
+      - MODEL_N_CTX=1024
+      - MODEL_N_THREADS=4
+      - LOG_LEVEL=INFO
+      - CONTAINER_MEMORY_LIMIT_MB=2500
+      - DEPLOYMENT_COLOR=green
+    env_file:
+      - .env
+    labels:
+      - "deployment.color=green"
+      - "deployment.port=8001"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/healthz"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 120s
+    networks:
+      - app-network
+    profiles:
+      - deploy
+
+  nginx:
+    image: nginx:alpine
+    container_name: smollm2-nginx
+    ports:
+      - "80:80"
+    mem_limit: 128m
+    mem_reservation: 64m
+    restart: always
+    volumes:
+      - ./nginx/conf.d:/etc/nginx/conf.d:ro
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+    depends_on:
+      blue:
+        condition: service_healthy
+    networks:
+      - app-network
+
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: smollm2-prometheus
+    ports:
+      - "9090:9090"
+    mem_limit: 256m
+    mem_reservation: 128m
+    restart: unless-stopped
+    volumes:
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.retention.time=24h"
+      - "--storage.tsdb.retention.size=100MB"
+      - "--web.enable-lifecycle"
+    networks:
+      - app-network
+
+  grafana:
+    image: grafana/grafana:latest
+    container_name: smollm2-grafana
+    ports:
+      - "3000:3000"
+    mem_limit: 256m
+    mem_reservation: 128m
+    restart: unless-stopped
+    environment:
+      - GF_SECURITY_ADMIN_USER=admin
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+      - GF_USERS_ALLOW_SIGN_UP=false
+      - GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH=/var/lib/grafana/dashboards/ml-deployment.json
+    volumes:
+      - ./monitoring/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./monitoring/grafana/dashboards:/var/lib/grafana/dashboards:ro
+    depends_on:
+      - prometheus
+    networks:
+      - app-network
+
+volumes:
+  app-data:
+    driver: local
+
+networks:
+  app-network:
+    driver: bridge
