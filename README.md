@@ -264,18 +264,6 @@ zero-downtime-ml/
 
 **Single-threaded inference** — SmolLM2-1.7B runs on CPU with a single Uvicorn worker. Peak throughput is ~0.1–0.2 inferences/sec. This is expected for CPU-only inference. GPU acceleration or model distillation would improve throughput but are out of scope.
 
-## Documentation
-
-Detailed write-ups for each phase:
-
-- [Phase 1: Single Container ML Inference](docs/phase1-single-container.md)
-- [Phase 2: Blue-Green Deployment with Nginx](docs/phase2-blue-green-deployment.md)
-- [Phase 3: Automated Deployment Orchestrator](docs/phase3-automated-deployment.md)
-- [Phase 4: Observability with Prometheus + Grafana](docs/phase4-observability.md)
-- [Phase 5: Load Testing with Locust](docs/phase5-load-testing.md)
-- [Phase 6: Pre-Warm Standby Mode](docs/phase6-prewarm-standby.md)
-- [Memory/mmap Deep Dive](docs/memory-mmap-gotcha.md)
-- [Comprehensive Technical Report (PDF)](docs/COMPREHENSIVE_PROJECT_REPORT.pdf)
 
 ## Technology Stack
 
