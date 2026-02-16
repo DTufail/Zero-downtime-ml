@@ -30,7 +30,7 @@ Deploying ML models in production without dropping requests is hard. Models are 
                     └────────┬─────────┘
                              │ shared read-only
                       ┌──────┴──────┐
-                      │ models/*.gguf│  mmap page cache
+                      │models/*.gguf│  mmap page cache
                       └──────┬──────┘  sharing (~1GB saved)
                              │
                     ┌────────┴───────┐
