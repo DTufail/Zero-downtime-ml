@@ -188,6 +188,9 @@ def main():
         "last_deployment": now,
         "last_model_version": state.get("last_model_version", "unknown"),
         "deployment_count": state.get("deployment_count", 0) + 1,
+        "standby_prewarmed": False,
+        "standby_prewarmed_at": None,
+        "standby_container_id": None,
         "history": state.get("history", []) + [{
             "timestamp": now,
             "from_color": current,

@@ -4,7 +4,8 @@
        deploy state history rollback rollback-blue rollback-green \
        test-deploy test-full-cycle deploy-log \
        up-full prom-targets prom-check grafana deploy-monitored generate-traffic \
-       install-locust test-baseline test-deploy-load report open-report results
+       install-locust test-baseline test-deploy-load report open-report results \
+       prewarm deploy-fast prewarm-and-deploy test-prewarm prewarm-status
 
 # === Phase 1: Single container ===
 
@@ -247,3 +248,30 @@ open-report:
 results:
 	@echo "Test results:"
 	@ls -la results/*/report.md results/*/*.html 2>/dev/null || echo "  No results yet. Run 'make test-baseline' first."
+
+# === Phase 6: Pre-Warm Standby Mode ===
+
+# Pre-warm the standby container (no traffic impact)
+prewarm:
+	python3 deploy/orchestrator.py prewarm --project-root .
+
+# Fast deploy using pre-warmed standby (<30s)
+deploy-fast:
+	python3 deploy/orchestrator.py deploy-fast --project-root .
+
+# Full prewarm + fast deploy workflow
+prewarm-and-deploy:
+	@echo "─── Phase 1: Pre-warming standby ───"
+	make prewarm
+	@echo ""
+	@echo "─── Phase 2: Fast deploy ───"
+	make deploy-fast
+
+# Test the prewarm + fast deploy workflow with monitoring
+test-prewarm:
+	bash tests/test_prewarm_deploy.sh
+
+# Check if standby is pre-warmed and ready
+prewarm-status:
+	@python3 -c "import json; s = json.load(open('deploy/state.json')); pw = s.get('standby_prewarmed', False); color = s.get('standby_color', '?'); at = s.get('standby_prewarmed_at', 'never'); print(f'Standby: {color}'); print(f'Pre-warmed: {\"YES\" if pw else \"NO\"}'); print(f'Pre-warmed at: {at}'); print(f'Ready for: make deploy-fast' if pw else 'Run: make prewarm')"
+

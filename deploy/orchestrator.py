@@ -184,6 +184,51 @@ class DeploymentOrchestrator:
         )
         return False
 
+    def _quick_health_check(self, port: int, timeout: int = 15) -> bool:
+        """Quick health check - just one attempt with timeout.
+        Used to verify a pre-warmed container is still alive."""
+        try:
+            result = self.run_command(
+                f"curl -sf --max-time {timeout} http://localhost:{port}/ready",
+                timeout=timeout + 5,
+                check=False
+            )
+            return result.returncode == 0
+        except Exception:
+            return False
+
+    def _get_container_id(self, color: str) -> str:
+        """Get the Docker container ID for a given color."""
+        result = self.run_command(
+            f"docker inspect --format='{{{{.Id}}}}' smollm2-{color}",
+            timeout=10,
+            check=True
+        )
+        return result.stdout.strip().strip("'")
+
+    def _is_container_running(self, color: str) -> bool:
+        """Check if a container is currently running."""
+        try:
+            result = self.run_command(
+                f"docker inspect --format='{{{{.State.Running}}}}' smollm2-{color}",
+                timeout=10,
+                check=False
+            )
+            return result.stdout.strip().strip("'") == "true"
+        except Exception:
+            return False
+
+    def _stop_container(self, color: str) -> None:
+        """Stop and remove a container."""
+        self.run_command(
+            f"docker compose --profile deploy stop smollm2-{color}",
+            timeout=30, check=False
+        )
+        self.run_command(
+            f"docker compose --profile deploy rm -f smollm2-{color}",
+            timeout=10, check=False
+        )
+
     # ── Helper: check if a compose service is running ─────────────
 
     def _is_service_running(self, service: str, profile: bool = False) -> bool:
@@ -443,10 +488,174 @@ class DeploymentOrchestrator:
         )
         self.log(f"  {old_color} stopped and removed")
 
+    # ── Pre-Warm Sequence ─────────────────────────────────────────
+
+    def prewarm(self) -> None:
+        """
+        Pre-warm the standby container without swapping traffic.
+
+        Executes:
+          1. Read state, determine standby color
+          2. Pre-flight checks (active healthy, nginx routing, no stale standby)
+          3. Start standby container
+          4. Poll standby /ready until healthy (NO timeout ceiling - patient wait)
+          5. Warm-up inference (real POST /chat)
+          6. Record container ID
+          7. Update state: standby_prewarmed=true, standby_prewarmed_at=now
+
+        Does NOT:
+          - Touch nginx config
+          - Stop the active container
+          - Change active_color in state
+
+        After this completes, the standby container is running, warm, and idle.
+        The user can then run deploy-fast at any time to complete the swap.
+        """
+        state = self.read_state()
+        active_color = state["active_color"]
+        standby_color = state["standby_color"]
+        active_port = state["active_port"]
+        standby_port = state["standby_port"]
+        prewarm_start = time.time()
+
+        self.log("=" * 60)
+        self.log(f"PRE-WARM START: Preparing {standby_color} container")
+        self.log(f"  Active: {active_color}:{active_port}")
+        self.log(f"  Standby: {standby_color}:{standby_port}")
+        self.log("=" * 60)
+
+        try:
+            # Step 1: Pre-flight checks
+            self.log("Step 1: Pre-flight checks...")
+
+            # Check active container is running
+            if not self._is_service_running(active_color):
+                raise DeploymentError(
+                    f"Active container '{active_color}' is not running"
+                )
+            self.log(f"  {active_color} container is running")
+
+            # Check active container healthy
+            self.log(f"  Checking {active_color} readiness on port {active_port}...")
+            healthy = self.check_container_health(active_port, timeout=120, poll_interval=2)
+            if not healthy:
+                raise DeploymentError(
+                    f"Active container '{active_color}' is not healthy on port {active_port}"
+                )
+
+            # Check nginx is routing
+            try:
+                r = subprocess.run(
+                    ["curl", "-sf", "--max-time", "5", "http://localhost/healthz"],
+                    capture_output=True,
+                    text=True,
+                    timeout=10,
+                )
+                if r.returncode != 0:
+                    raise DeploymentError(
+                        "Nginx is not routing traffic (port 80 /healthz failed)"
+                    )
+            except subprocess.TimeoutExpired:
+                raise DeploymentError("Nginx health check timed out")
+            self.log("  Nginx routing OK via port 80")
+
+            # Check if standby is already running (stale from failed deploy?)
+            if self._is_container_running(standby_color):
+                # Check if it's already pre-warmed
+                if state.get("standby_prewarmed", False):
+                    self.log(f"  ⚠️  {standby_color} already pre-warmed at {state.get('standby_prewarmed_at', 'unknown')}")
+                    self.log(f"  Verifying it's still healthy...")
+
+                    # Quick health check - if still healthy, skip prewarm
+                    if self._quick_health_check(standby_port, timeout=15):
+                        elapsed = round(time.time() - prewarm_start, 1)
+                        self.log(f"  ✓ {standby_color} still healthy. Skipping re-prewarm.")
+                        self.log(f"PRE-WARM COMPLETE (already warm): {elapsed}s")
+                        return
+                    else:
+                        self.log(f"  {standby_color} not healthy. Stopping and re-prewarming...")
+                        self._stop_container(standby_color)
+                else:
+                    self.log(f"  ⚠️  Stale {standby_color} container found. Stopping it first...")
+                    self._stop_container(standby_color)
+
+            self.log("Step 1: ✓ Pre-flight passed")
+
+            # Step 2: Start standby container
+            self.log(f"Step 2: Starting {standby_color} container...")
+            self.start_standby(state)
+            self.log("Step 2: ✓ Container started")
+
+            # Step 3: Poll health (PATIENT - use longer timeout than deploy)
+            # For prewarm, we're not in a rush. Use 300s (5 min) timeout.
+            # On 8GB Mac with CPU contention from active container, model load
+            # can take 80-120s. 300s gives ample margin.
+            self.log(f"Step 3: Polling {standby_color} health (patient mode, 300s timeout)...")
+            healthy = self.check_container_health(
+                standby_port,
+                timeout=300,     # 5 minutes - very patient
+                poll_interval=3  # Check every 3s (less aggressive than deploy's 2s)
+            )
+            if not healthy:
+                raise DeploymentError(f"{standby_color} failed health check after 300s")
+            self.log("Step 3: ✓ Health check passed")
+
+            # Step 4: Warm-up inference
+            self.log("Step 4: Warm-up inference...")
+            self.warmup_inference(standby_port)
+            self.log("Step 4: ✓ Inference verified")
+
+            # Step 5: Record container ID for later verification
+            container_id = self._get_container_id(standby_color)
+            self.log(f"Step 5: Container ID: {container_id[:12]}")
+
+            # Step 6: Update state (mark as pre-warmed, but DON'T change active_color)
+            elapsed = round(time.time() - prewarm_start, 1)
+            state["standby_prewarmed"] = True
+            state["standby_prewarmed_at"] = datetime.now(timezone.utc).isoformat()
+            state["standby_container_id"] = container_id
+            self.save_state(state)
+
+            self.log("=" * 60)
+            self.log(f"PRE-WARM COMPLETE: {standby_color} is warm and idle ({elapsed}s)")
+            self.log(f"  Run 'make deploy-fast' to swap traffic (takes <30s)")
+            self.log("=" * 60)
+
+        except DeploymentError as e:
+            self.log(f"❌ PRE-WARM FAILED: {e}", level="ERROR")
+
+            # Clean up: stop the standby container
+            self.log(f"Stopping failed {standby_color} container...")
+            try:
+                self._stop_container(standby_color)
+                self.log(f"✓ {standby_color} stopped")
+            except Exception:
+                self.log(f"Warning: Could not stop {standby_color}", level="WARNING")
+
+            # Clear prewarm state
+            state["standby_prewarmed"] = False
+            state["standby_prewarmed_at"] = None
+            state["standby_container_id"] = None
+            self.save_state(state)
+
+            raise
+
     # ── Main Deploy Sequence ──────────────────────────────────────
 
     def deploy(self) -> None:
         state = self.read_state()
+
+        # If standby is already pre-warmed, stop it first - deploy will start fresh
+        if state.get("standby_prewarmed", False):
+            standby_color = state["standby_color"]
+            self.log(f"Note: {standby_color} was pre-warmed. Stopping for fresh deploy.")
+            if self._is_container_running(standby_color):
+                self._stop_container(standby_color)
+            state["standby_prewarmed"] = False
+            state["standby_prewarmed_at"] = None
+            state["standby_container_id"] = None
+            self.save_state(state)
+
         active_color = state["active_color"]
         target_color = state["standby_color"]
         active_port = state["active_port"]
@@ -530,6 +739,9 @@ class DeploymentOrchestrator:
                     "last_model_version", "unknown"
                 ),
                 "deployment_count": state.get("deployment_count", 0) + 1,
+                "standby_prewarmed": False,
+                "standby_prewarmed_at": None,
+                "standby_container_id": None,
                 "history": state.get("history", [])
                 + [
                     {
@@ -602,6 +814,209 @@ class DeploymentOrchestrator:
 
             raise
 
+    # ── Fast Deploy Sequence (using pre-warmed container) ─────────
+
+    def deploy_fast(self) -> None:
+        """
+        Fast deployment using pre-warmed standby container.
+
+        Prerequisites:
+          - make prewarm must have been run successfully
+          - state.standby_prewarmed must be True
+          - The same standby container must still be running
+
+        Executes:
+          1. Read state, verify standby_prewarmed=True
+          2. Verify standby container is the same one that was prewarmed (container ID match)
+          3. Re-verify standby health (quick check, not full poll)
+          4. Quick inference verification
+          5-6. Swap nginx config + reload
+          7. Drain period (15s)
+          8. Verify traffic switched
+          9. Stop old container
+          10. Update state (flip active/standby, reset prewarm flags)
+
+        Duration target: <30s (model already loaded)
+        """
+        state = self.read_state()
+        active_color = state["active_color"]
+        standby_color = state["standby_color"]
+        active_port = state["active_port"]
+        standby_port = state["standby_port"]
+        deploy_start = time.time()
+        original_nginx_config = None
+
+        self.log("=" * 60)
+        self.log(f"FAST DEPLOY START: {active_color} → {standby_color}")
+        self.log("=" * 60)
+
+        try:
+            # Step 1: Verify pre-warm state
+            self.log("Step 1: Checking pre-warm state...")
+            if not state.get("standby_prewarmed", False):
+                raise DeploymentError(
+                    "Standby not pre-warmed. Run 'make prewarm' first."
+                )
+
+            prewarm_time = state.get("standby_prewarmed_at", "unknown")
+            self.log(f"  Pre-warmed at: {prewarm_time}")
+
+            # Check staleness - warn if prewarm was more than 1 hour ago
+            if state.get("standby_prewarmed_at"):
+                try:
+                    prewarm_dt = datetime.fromisoformat(
+                        state["standby_prewarmed_at"].replace("Z", "+00:00")
+                    )
+                    age_seconds = (datetime.now(timezone.utc) - prewarm_dt).total_seconds()
+                    age_minutes = age_seconds / 60
+
+                    if age_minutes > 60:
+                        self.log(f"  ⚠️  Pre-warm is {age_minutes:.0f} minutes old. "
+                                f"Running thorough health check...")
+                    else:
+                        self.log(f"  Pre-warm age: {age_minutes:.1f} minutes")
+                except Exception:
+                    self.log("  Could not parse prewarm timestamp, proceeding with health check")
+
+            self.log("Step 1: ✓ Pre-warm state verified")
+
+            # Step 2: Verify container ID matches
+            self.log("Step 2: Verifying container identity...")
+            expected_id = state.get("standby_container_id")
+
+            if not self._is_container_running(standby_color):
+                raise DeploymentError(
+                    f"{standby_color} container is not running. "
+                    f"It may have been stopped or OOM-killed since prewarm. "
+                    f"Run 'make prewarm' again."
+                )
+
+            if expected_id:
+                current_id = self._get_container_id(standby_color)
+                if current_id != expected_id:
+                    raise DeploymentError(
+                        f"Container ID mismatch. Expected {expected_id[:12]}, "
+                        f"got {current_id[:12]}. Container was recreated since prewarm. "
+                        f"Run 'make prewarm' again."
+                    )
+                self.log(f"  Container ID match: {current_id[:12]}")
+            else:
+                self.log("  No container ID in state (skipping ID verification)")
+
+            self.log("Step 2: ✓ Container identity verified")
+
+            # Step 3: Re-verify health (quick, not full poll)
+            self.log("Step 3: Quick health re-check...")
+            healthy = self._quick_health_check(standby_port, timeout=30)
+            if not healthy:
+                raise DeploymentError(
+                    f"{standby_color} failed quick health check. "
+                    f"Model may have crashed since prewarm. "
+                    f"Run 'make prewarm' again."
+                )
+            self.log("Step 3: ✓ Standby still healthy")
+
+            # Step 4: Quick inference verification
+            self.log("Step 4: Quick inference verification...")
+            self.warmup_inference(standby_port)
+            self.log("Step 4: ✓ Inference working")
+
+            # ─── POINT OF NO RETURN ───
+
+            # Step 5-6: Swap nginx
+            self.log("Step 5-6: Swapping nginx upstream...")
+            original_nginx_config = self.swap_nginx(standby_color)
+            self.log("Step 5-6: ✓ Nginx reloaded")
+
+            # Step 7: Drain period
+            drain = self.drain_seconds
+            self.log(f"Step 7: Draining old connections ({drain}s)...")
+            time.sleep(drain)
+            self.log("Step 7: ✓ Drain complete")
+
+            # Step 8: Verify traffic switched
+            self.log("Step 8: Verifying traffic switch...")
+            switched = self.verify_traffic_switched(standby_port)
+            if not switched:
+                raise DeploymentError("Traffic not reaching standby after nginx reload")
+            self.log("Step 8: ✓ Traffic verified on standby")
+
+            # Step 9: Stop old container
+            self.log(f"Step 9: Stopping {active_color}...")
+            self.drain_and_stop_old(active_color, drain_seconds=0)
+            self.log(f"Step 9: ✓ {active_color} stopped")
+
+            # Step 10: Update state
+            elapsed = round(time.time() - deploy_start, 1)
+            now = datetime.now(timezone.utc).isoformat()
+            new_state = {
+                "active_color": standby_color,
+                "active_port": standby_port,
+                "standby_color": active_color,
+                "standby_port": active_port,
+                "last_deployment": now,
+                "last_model_version": state.get("last_model_version", "unknown"),
+                "deployment_count": state.get("deployment_count", 0) + 1,
+                "standby_prewarmed": False,       # Reset prewarm flags
+                "standby_prewarmed_at": None,
+                "standby_container_id": None,
+                "history": state.get("history", []) + [{
+                    "timestamp": now,
+                    "from_color": active_color,
+                    "to_color": standby_color,
+                    "duration_seconds": elapsed,
+                    "success": True,
+                    "mode": "fast",               # Distinguish from normal deploy
+                }]
+            }
+            new_state["history"] = new_state["history"][-20:]
+            self.save_state(new_state)
+
+            self.log("=" * 60)
+            self.log(f"FAST DEPLOY COMPLETE: {standby_color} is now active ({elapsed}s)")
+            self.log("=" * 60)
+
+        except DeploymentError as e:
+            self.log(f"❌ FAST DEPLOY FAILED: {e}", level="ERROR")
+
+            # Rollback nginx if we already swapped
+            if original_nginx_config is not None:
+                self.log("Rolling back nginx config...")
+                try:
+                    self.rollback_nginx(original_nginx_config)
+                    self.log("✓ Nginx rolled back")
+                except Exception as rollback_err:
+                    self.log(f"❌ CRITICAL: Nginx rollback failed: {rollback_err}", level="CRITICAL")
+
+            # Do NOT stop the standby container on fast-deploy failure.
+            # It's still pre-warmed and potentially useful. Just leave it running.
+            # The user can retry deploy-fast or run make deploy (full sequence).
+            self.log(f"Note: {standby_color} container left running (still pre-warmed)")
+
+            # Reset prewarm state ONLY if the container is actually dead
+            if not self._is_container_running(standby_color):
+                state["standby_prewarmed"] = False
+                state["standby_prewarmed_at"] = None
+                state["standby_container_id"] = None
+                self.save_state(state)
+
+            # Record failure
+            state = self.read_state()
+            elapsed = round(time.time() - deploy_start, 1)
+            state.setdefault("history", []).append({
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "from_color": active_color,
+                "to_color": standby_color,
+                "duration_seconds": elapsed,
+                "success": False,
+                "mode": "fast",
+                "error": str(e),
+            })
+            state["history"] = state["history"][-20:]
+            self.save_state(state)
+
+            raise
+
     # ── Rollback Command ──────────────────────────────────────────
 
     def rollback(self) -> None:
@@ -656,6 +1071,9 @@ class DeploymentOrchestrator:
             "last_deployment": now,
             "last_model_version": state.get("last_model_version", "unknown"),
             "deployment_count": state.get("deployment_count", 0) + 1,
+            "standby_prewarmed": False,
+            "standby_prewarmed_at": None,
+            "standby_container_id": None,
             "history": state.get("history", [])
             + [
                 {
@@ -727,6 +1145,33 @@ class DeploymentOrchestrator:
             for line in content.splitlines():
                 if "server " in line and "listen" not in line:
                     print(f"    {line.strip()}")
+        print()
+
+        # Pre-warm status
+        if state.get("standby_prewarmed", False):
+            standby_color = state["standby_color"]
+            prewarm_at = state.get("standby_prewarmed_at", "unknown")
+            container_id = state.get("standby_container_id", "unknown")
+
+            is_running = self._is_container_running(standby_color)
+
+            print(f"  Pre-warm Status:")
+            print(f"    Standby:     {standby_color} (pre-warmed)")
+            print(f"    Pre-warmed:  {prewarm_at}")
+            print(f"    Container:   {container_id[:12] if container_id else 'unknown'}")
+            print(f"    Running:     {'YES ✓' if is_running else 'NO ❌ (needs re-prewarm)'}")
+
+            if is_running:
+                standby_port = state["standby_port"]
+                healthy = self._quick_health_check(standby_port, timeout=10)
+                print(f"    Healthy:     {'YES ✓' if healthy else 'NO ⚠️ (may need re-prewarm)'}")
+                print(f"\n  ✅ Ready for: make deploy-fast")
+            else:
+                print(f"\n  ⚠️  Standby stopped. Run: make prewarm")
+        else:
+            print(f"  Pre-warm Status: Not pre-warmed")
+            print(f"  ℹ️  Options: make deploy (full) or make prewarm + make deploy-fast")
+
         print(f"{'=' * 50}\n")
 
     def show_history(self) -> None:
@@ -760,7 +1205,7 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "command",
-        choices=["deploy", "status", "rollback", "history"],
+        choices=["deploy", "deploy-fast", "prewarm", "status", "rollback", "history"],
         help="Command to execute",
     )
     parser.add_argument(
@@ -791,6 +1236,10 @@ if __name__ == "__main__":
     try:
         if args.command == "deploy":
             orchestrator.deploy()
+        elif args.command == "prewarm":
+            orchestrator.prewarm()
+        elif args.command == "deploy-fast":
+            orchestrator.deploy_fast()
         elif args.command == "status":
             orchestrator.status()
         elif args.command == "rollback":

@@ -16,3 +16,6 @@ venv/
 
 # Deployment state backup
 deploy/state.json.bak
+
+# Models (large files)
+models/*.gguf
